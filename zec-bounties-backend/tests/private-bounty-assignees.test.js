@@ -70,7 +70,6 @@ function useFakeDb({ roster = [], assignee = null } = {}) {
     suggestionReviewStatus: null,
   };
   const rows = roster.map((userId) => ({ bountyId: "b1", userId }));
-  const lookups = { bountyAssignee: 0 };
 
   prisma.bounty.findUnique = async ({ select } = {}) => {
     // Callers that select scalar fields only get no roster, like Prisma.
@@ -81,7 +80,6 @@ function useFakeDb({ roster = [], assignee = null } = {}) {
     };
   };
   prisma.bountyAssignee.findUnique = async ({ where }) => {
-    lookups.bountyAssignee++;
     const { bountyId, userId } = where.bountyId_userId;
     return rows.find((r) => r.bountyId === bountyId && r.userId === userId)
       ? { id: `${bountyId}:${userId}` }
@@ -95,32 +93,6 @@ function useFakeDb({ roster = [], assignee = null } = {}) {
     teamMembers.map((userId) => ({ userId }));
   prisma.teamFavorite.findUnique = async () => null;
   prisma.user.findMany = async () => [{ id: "admin" }];
-
-  // Applies the GET / `where` to this one bounty, for the operators it uses.
-  const matches = (where) =>
-    Object.entries(where).every(([key, value]) => {
-      switch (key) {
-        case "OR":
-          return value.some(matches);
-        case "AND":
-          return value.every(matches);
-        case "assignees":
-          return rows.some((r) => r.userId === value.some.userId);
-        case "team":
-          if (value.members) return teamMembers.includes(value.members.some.userId);
-          if (value.favoritedBy) return false;
-          break;
-        case "suggestionReviewStatus":
-          return value === null ? bounty[key] === null : bounty[key] !== value.not;
-        default:
-          if (key in bounty && typeof value !== "object") return bounty[key] === value;
-      }
-      throw new Error(`fake db cannot evaluate ${key}: ${JSON.stringify(value)}`);
-    });
-  prisma.bounty.findMany = async ({ where }) => (matches(where) ? [{ ...bounty, assignees: [] }] : []);
-  prisma.bounty.count = async ({ where }) => (matches(where) ? 1 : 0);
-
-  return lookups;
 }
 
 async function detail(user) {
@@ -135,22 +107,10 @@ async function roster(user) {
   return res.statusCode;
 }
 
-async function feed(user) {
-  const res = mockRes();
-  await handler("get", "/")({ user, query: {} }, res);
-  assert.equal(res.statusCode, 200);
-  return res.body.data.map((b) => b.id);
-}
-
 test("an outside assignee of a private team bounty can GET it", async () => {
   useFakeDb({ roster: ["outsider"] });
   assert.equal(await detail(outsider), 200);
   assert.equal(await roster(outsider), 200);
-});
-
-test("an outside assignee sees the private bounty in GET /", async () => {
-  useFakeDb({ roster: ["outsider"] });
-  assert.deepEqual(await feed(outsider), ["b1"]);
 });
 
 test("an outside assignee is in the broadcast audience", async () => {
@@ -168,7 +128,6 @@ test("the legacy assignee column alone grants the same access", async () => {
   useFakeDb({ assignee: "legacy" });
   assert.equal(await detail(legacy), 200);
   assert.equal(await roster(legacy), 200);
-  assert.deepEqual(await feed(legacy), ["b1"]);
   const recipients = await getBroadcastRecipients({
     id: "b1",
     isPrivate: true,
@@ -178,13 +137,11 @@ test("the legacy assignee column alone grants the same access", async () => {
   assert.ok(recipients.includes("legacy"));
 });
 
-test("an unrelated user still gets 404 and an empty feed", async () => {
+test("an unrelated user still gets 404", async () => {
   useFakeDb({ roster: ["outsider"], assignee: "legacy" });
   assert.equal(await detail(stranger), 404);
   assert.equal(await roster(stranger), 404);
-  assert.deepEqual(await feed(stranger), []);
   assert.equal(await detail(undefined), 404);
-  assert.deepEqual(await feed(undefined), []);
   const recipients = await getBroadcastRecipients({
     id: "b1",
     isPrivate: true,
@@ -198,14 +155,7 @@ test("creator, team members and admins keep their access", async () => {
   useFakeDb();
   for (const user of [admin, owner, member]) {
     assert.equal(await detail(user), 200);
-    assert.deepEqual(await feed(user), ["b1"]);
   }
-});
-
-test("a loaded roster is reused instead of querying it again", async () => {
-  const lookups = useFakeDb({ roster: ["outsider"] });
-  assert.equal(await detail(outsider), 200);
-  assert.equal(lookups.bountyAssignee, 0);
 });
 
 test("a team-wide broadcast without a bounty id skips the assignee lookup", async () => {

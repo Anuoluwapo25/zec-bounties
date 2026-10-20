@@ -7,6 +7,8 @@ receive its realtime events. Users who are neither the creator, an admin, a
 team member nor an assignee must still get 404.
 
 `private-bounty-assignees.test.js` runs with `npm test` and needs no database.
+It covers `GET /:id`, `GET /:id/assignees` and the broadcast audience; the
+`GET /` filter is left to the PostgreSQL test.
 `private-bounty-assignee-postgres.test.js` loads the actual routes and helpers
 on real Prisma queries, so the `GET /` filter is checked by PostgreSQL itself.
 It covers an assignee added through `POST /:id/assignees`, the legacy
