@@ -92,6 +92,7 @@ function useFakeDb({ roster = [], assignee = null } = {}) {
   prisma.teamMember.findMany = async () =>
     teamMembers.map((userId) => ({ userId }));
   prisma.teamFavorite.findUnique = async () => null;
+  prisma.teamFavorite.findMany = async () => [];
   prisma.user.findMany = async () => [{ id: "admin" }];
 }
 
