@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { Navbar } from "@/components/layout/navbar";
+import { AdminNavbar } from "@/components/layout/admin/navbar";
 import { ProtectedRoute } from "@/components/auth/protected-route";
 import { useBounty } from "@/lib/bounty-context";
 import { backendUrl } from "@/lib/configENV";
@@ -215,25 +216,33 @@ export default function PublicUserProfilePage() {
     }
   };
 
-  // Decode UA → receivers whenever profile changes (same as KPI dashboard)
+  // Visitors do not receive the raw address. Use the backend flags. Owner and
+  // admin still receive the address and refine those flags with the browser
+  // WASM decoder (same path as the KPI dashboard).
   useEffect(() => {
     let cancelled = false;
     setReceivers(null);
 
     if (!v?.showAddressType) return;
 
+    const fromApi = (profile as any)?.receivers;
     const addr =
       (profile as any).UA_address || (profile as any).z_address || null;
 
     if (!addr) {
-      setReceivers({ ironwood: false, sapling: false, transparent: false });
+      setReceivers(
+        fromApi ?? { ironwood: false, sapling: false, transparent: false },
+      );
       return;
     }
 
     (async () => {
       try {
         await initAddressDecoder();
-        if (cancelled || !isDecoderReady()) return;
+        if (cancelled || !isDecoderReady()) {
+          if (!cancelled && fromApi) setReceivers(fromApi);
+          return;
+        }
 
         const r = getAddressReceivers(addr) as any;
         if (cancelled) return;
@@ -246,7 +255,9 @@ export default function PublicUserProfilePage() {
       } catch (err) {
         console.error("Address decode failed:", err);
         if (!cancelled) {
-          setReceivers({ ironwood: false, sapling: false, transparent: false });
+          setReceivers(
+            fromApi ?? { ironwood: false, sapling: false, transparent: false },
+          );
         }
       }
     })();
@@ -254,7 +265,7 @@ export default function PublicUserProfilePage() {
     return () => {
       cancelled = true;
     };
-  }, [profile?.id, v?.showAddressType]);
+  }, [profile?.id, v?.showAddressType, (profile as any)?.receivers]);
 
   const chainStats = profile?.statsByChain?.[chain];
   const completed = chainStats?.completed ?? profile?.completed ?? 0;
@@ -284,7 +295,7 @@ export default function PublicUserProfilePage() {
   return (
     <ProtectedRoute>
       <main className="min-h-screen bg-background">
-        <Navbar />
+        {isAdmin ? <AdminNavbar /> : <Navbar />}
         <div
           key={idOrNickname}
           className="max-w-3xl mx-auto px-4 sm:px-6 py-8 space-y-6"
@@ -466,6 +477,30 @@ export default function PublicUserProfilePage() {
                 </CardContent>
               </Card>
 
+              <div className="flex items-center justify-end gap-2">
+                <span className="text-xs text-muted-foreground">Network</span>
+                <div className="inline-flex rounded-md border p-0.5">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={chain === "MAIN" ? "default" : "ghost"}
+                    className="h-7 px-3 text-xs"
+                    onClick={() => setChain("MAIN")}
+                  >
+                    Mainnet
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={chain === "TEST" ? "default" : "ghost"}
+                    className="h-7 px-3 text-xs"
+                    onClick={() => setChain("TEST")}
+                  >
+                    Testnet
+                  </Button>
+                </div>
+              </div>
+
               {isAdmin && (
                 <StaffViewCard
                   chain={chain === "TEST" ? "TEST" : "MAIN"}
@@ -507,28 +542,7 @@ export default function PublicUserProfilePage() {
                   )}
                 </CardContent>
               </Card>
-              <div className="flex items-center justify-end">
-                <div className="inline-flex rounded-md border p-0.5">
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant={chain === "MAIN" ? "default" : "ghost"}
-                    className="h-7 px-3 text-xs"
-                    onClick={() => setChain("MAIN")}
-                  >
-                    Mainnet
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant={chain === "TEST" ? "default" : "ghost"}
-                    className="h-7 px-3 text-xs"
-                    onClick={() => setChain("TEST")}
-                  >
-                    Testnet
-                  </Button>
-                </div>
-              </div>
+
               <div className="grid grid-cols-2 imd:grid-cols-4 gap-3">
                 <Card>
                   <CardContent className="pt-4 pb-4">

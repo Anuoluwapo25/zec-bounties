@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const express = require("express");
 const axios = require("axios");
 const bcrypt = require("bcrypt");
@@ -21,6 +22,10 @@ const executeZingoCliRecoveryInfo = require("../utils/zingo/zingoLibRecoveryInfo
 const { delCache, deleteCacheByPattern } = require("../utils/cache");
 const { sendUserUpdated } = require("../middleware/websocket");
 const { OtpStore } = require("../helpers/recoveryOtp");
+const {
+  verifiedPrimaryEmail,
+  isOtherGithubAccount,
+} = require("../helpers/githubLogin");
 
 const router = express.Router();
 const SECRET = process.env.JWT_SECRET;
@@ -33,14 +38,45 @@ const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const DISCORD_REDIRECT_URI = `${process.env.BACKEND_URL || "http://localhost:5000"}/auth/discord/callback`;
 
+const STATE_COOKIE = {
+  httpOnly: true,
+  sameSite: "lax",
+  secure: process.env.NODE_ENV === "production",
+  maxAge: 10 * 60 * 1000,
+};
+
+// The login page makes its own state and checks it again on its callback page,
+// so a link that carries someone else's token cannot sign a user in. The
+// backend only carries it, so the format check is all it needs.
+const LOGIN_STATE = /^[0-9a-f]{64}$/;
+const isLoginState = (value) =>
+  typeof value === "string" && LOGIN_STATE.test(value);
+
 router.get("/github", (req, res) => {
-  const githubAuthUrl = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&scope=user:email`;
-  res.redirect(githubAuthUrl);
+  const { state: loginState } = req.query;
+  if (loginState !== undefined && !isLoginState(loginState)) {
+    return res.redirect(`${FRONTEND_URL}/login?error=oauth_failed`);
+  }
+  if (loginState) res.cookie("gh_login_state", loginState, STATE_COOKIE);
+  else res.clearCookie("gh_login_state");
+
+  const state = crypto.randomBytes(16).toString("hex");
+  res.cookie("gh_state", state, STATE_COOKIE);
+  res.redirect(
+    `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&scope=user:email&state=${state}`,
+  );
 });
 
 // GitHub callback
 router.get("/github/callback", async (req, res) => {
-  const { code, error, error_description } = req.query;
+  const { code, state, error, error_description } = req.query;
+
+  if (!state || state !== req.cookies?.gh_state) {
+    return res.redirect(`${FRONTEND_URL}/login?error=oauth_failed`);
+  }
+  res.clearCookie("gh_state");
+  const loginState = req.cookies?.gh_login_state;
+  res.clearCookie("gh_login_state");
 
   if (error) {
     console.log(`GitHub OAuth error: ${error} - ${error_description}`);
@@ -90,27 +126,33 @@ router.get("/github/callback", async (req, res) => {
     );
 
     const githubUser = userResponse.data;
-    const emails = emailResponse.data;
+const githubId = githubUser.id.toString();
+const primaryEmail = verifiedPrimaryEmail(emailResponse.data);
+if (!primaryEmail) {
+  console.log("No verified primary email for GitHub user");
+  return res.redirect(`${FRONTEND_URL}/login?error=no_email`);
+}
 
-    const primaryEmail =
-      emails.find((email) => email.primary)?.email || githubUser.email;
+// 1. Key on the immutable GitHub ID first.
+let user = await prisma.user.findFirst({ where: { githubId } });
+if (isOtherGithubAccount(user, githubId)) {
+  console.log("Email belongs to an account linked to another GitHub user");
+  return res.redirect(`${FRONTEND_URL}/login?error=account_mismatch`);
+}
 
-    if (!primaryEmail) {
-      console.log("No email found for GitHub user");
-      return res.redirect(`${FRONTEND_URL}/login?error=no_email`);
-    }
+if (!user) {
+  const byEmail = await prisma.user.findFirst({
+    where: { email: { equals: primaryEmail, mode: "insensitive" } },
+  });
 
-    let user = await prisma.user.findUnique({
-      where: { email: primaryEmail },
-    });
+      if (byEmail) {
+        // Existing account (e.g. a migrated legacy one) with no GitHub link yet.
+        // Don't auto-link or log in as it. Send the user to an authenticated link flow.
+        return res.redirect(`${FRONTEND_URL}/login?error=account_exists`);
+      }
 
-    if (!user) {
       let nickname = githubUser.login.toLowerCase();
-
-      const exists = await prisma.user.findUnique({
-        where: { nickname },
-      });
-
+      const exists = await prisma.user.findUnique({ where: { nickname } });
       if (exists) {
         nickname = `${nickname}.${Math.floor(Math.random() * 10000)}`;
       }
@@ -120,24 +162,17 @@ router.get("/github/callback", async (req, res) => {
           name: githubUser.name || githubUser.login,
           nickname,
           email: primaryEmail,
-          githubId: githubUser.id.toString(),
+          githubId,
           avatar: githubUser.avatar_url,
           role: "CLIENT",
-        },
-      });
-    } else if (!user.githubId) {
-      user = await prisma.user.update({
-        where: { id: user.id },
-        data: {
-          githubId: githubUser.id.toString(),
-          avatar: githubUser.avatar_url,
         },
       });
     }
 
     const token = signSessionToken(user);
 
-    res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}`);
+    const returnState = isLoginState(loginState) ? `&state=${loginState}` : "";
+    res.redirect(`${FRONTEND_URL}/auth/callback?token=${token}${returnState}`);
   } catch (error) {
     console.error("GitHub OAuth error:", error.message);
     res.redirect(`${FRONTEND_URL}/login?error=oauth_failed`);

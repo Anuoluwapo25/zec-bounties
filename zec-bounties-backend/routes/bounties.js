@@ -1,7 +1,7 @@
 const express = require("express");
 const prisma = require("../prisma/client");
 const { getSuggestionSettings } = require("../utils/suggestionSettings");
-const { formatEmailText } = require("../helpers/email");
+const { escapeHtml, formatEmailText } = require("../helpers/email");
 const router = express.Router();
 const {
   authenticate,
@@ -46,11 +46,14 @@ const {
   sendMailIfEnabled,
   sendPushToOptedIn,
   getBroadcastRecipients,
+  getSubmissionRecipients,
+  withoutSubmissionBodies,
   broadcastBountyEvent,
   invalidateBounty,
   ONBOARDED_ROLES,
   requireOnboarded,
   getWeeklyBountyQuota,
+  hasWeeklyQuota,
   createBountyWithQuota,
   WeeklyBountyQuotaError,
   requireTaskCreation,
@@ -299,6 +302,73 @@ function getCalendarWeekBounds(date = new Date()) {
   return { start, end };
 }
 
+// Emails and pushes a new bounty to its audience.
+// Called only once the bounty is approved: before that, nobody has reviewed the text that goes out.
+async function announceNewBounty(bounty, creatorId, recipients) {
+  try {
+    const creatorDisplayName =
+      bounty.createdByUser?.nickname || bounty.createdByUser?.name || "Unknown";
+
+    const cachedUsers = await getCache("users:all");
+
+    const users =
+      cachedUsers ??
+      (await prisma.user.findMany({
+        select: {
+          id: true,
+          email: true,
+          emailNotifications: true,
+          pushNotifications: true,
+        },
+      }));
+
+    const audience = recipients && new Set(recipients);
+
+    const otherUsers = users.filter(
+      (u) => u.id !== creatorId && (!audience || audience.has(u.id)),
+    );
+
+    const emailRecipients = otherUsers
+      .filter((u) => u.emailNotifications !== false)
+      .map((u) => u.email)
+      .filter(Boolean);
+
+    const pushCandidateIds = otherUsers
+      .filter((u) => u.pushNotifications)
+      .map((u) => u.id);
+
+    await Promise.all([
+      sendPushToOptedIn(pushCandidateIds, {
+        title: "New Bounty Available",
+        body: `${bounty.title} — ${bounty.bountyAmount} ZEC`,
+        url: `/bounty/${bounty.id}`,
+      }),
+
+      Promise.all(
+        emailRecipients.map((recipient) =>
+          sendMailIfEnabled({
+            to: recipient,
+            subject: `New Bounty Created: ${bounty.title}`,
+            text: `A new bounty has been created.\n\nCreated by: ${creatorDisplayName}\n\nTitle: ${bounty.title}\nAmount: ${bounty.bountyAmount}`,
+            html: `
+              <h2>New Bounty Created</h2>
+              <p><strong>Created by:</strong> ${escapeHtml(creatorDisplayName)}</p>
+              <p><strong>Title:</strong> ${escapeHtml(bounty.title)}</p>
+              <p><strong>Description:</strong><br/>
+                ${formatEmailText(bounty.description)}
+              </p>
+              <p><strong>Amount:</strong> ${bounty.bountyAmount} ZEC</p>
+              <p><strong>Time to complete:</strong> ${escapeHtml(bounty.timeToComplete)}</p>
+            `,
+          }),
+        ),
+      ),
+    ]);
+  } catch (notificationErr) {
+    console.error("Bounty notification failed:", notificationErr);
+  }
+}
+
 // ─── Create bounty ────────────────────────────────────────────────────────────
 router.post("/", authenticate, requireTaskCreation, async (req, res) => {
   try {
@@ -444,74 +514,14 @@ router.post("/", authenticate, requireTaskCreation, async (req, res) => {
 
     await bumpVersion("bounties");
 
-    if (!bounty.isPrivate) notifyNewBounty(bounty);
-
     res.status(201).json(bounty);
 
-    (async () => {
-      try {
-        const creatorDisplayName =
-          bounty.createdByUser.nickname || bounty.createdByUser.name;
-
-        const cachedUsers = await getCache("users:all");
-
-        const users =
-          cachedUsers ??
-          (await prisma.user.findMany({
-            select: {
-              id: true,
-              email: true,
-              emailNotifications: true,
-              pushNotifications: true,
-            },
-          }));
-
-        const audience = recipients && new Set(recipients);
-
-        const otherUsers = users.filter(
-          (u) => u.id !== req.user.id && (!audience || audience.has(u.id)),
-        );
-
-        const emailRecipients = otherUsers
-          .filter((u) => u.emailNotifications !== false)
-          .map((u) => u.email)
-          .filter(Boolean);
-
-        const pushCandidateIds = otherUsers
-          .filter((u) => u.pushNotifications)
-          .map((u) => u.id);
-
-        await Promise.all([
-          sendPushToOptedIn(pushCandidateIds, {
-            title: "New Bounty Available",
-            body: `${bounty.title} — ${bounty.bountyAmount} ZEC`,
-            url: `/bounty/${bounty.id}`,
-          }),
-
-          Promise.all(
-            emailRecipients.map((recipient) =>
-              sendMailIfEnabled({
-                to: recipient,
-                subject: `New Bounty Created: ${bounty.title}`,
-                text: `A new bounty has been created.\n\nCreated by: ${creatorDisplayName}\n\nTitle: ${bounty.title}\nAmount: ${bounty.bountyAmount}`,
-                html: `
-                  <h2>New Bounty Created</h2>
-                  <p><strong>Created by:</strong> ${creatorDisplayName}</p>
-                  <p><strong>Title:</strong> ${bounty.title}</p>
-                  <p><strong>Description:</strong><br/>
-                    ${formatEmailText(bounty.description)}
-                  </p>
-                  <p><strong>Amount:</strong> ${bounty.bountyAmount} ZEC</p>
-                  <p><strong>Time to complete:</strong> ${bounty.timeToComplete}</p>
-                `,
-              }),
-            ),
-          ),
-        ]);
-      } catch (notificationErr) {
-        console.error("Bounty notification failed:", notificationErr);
-      }
-    })();
+    // Announce only if the bounty is already approved (admin/team create).
+    // Unapproved hunter suggestions wait for the approve endpoint.
+    if (bounty.isApproved) {
+      if (!bounty.isPrivate) notifyNewBounty(bounty);
+      announceNewBounty(bounty, req.user.id, recipients);
+    }
   } catch (err) {
     if (err instanceof WeeklyBountyQuotaError) {
       return res.status(429).json({
@@ -1164,6 +1174,25 @@ router.patch("/:id/approve", authenticate, isAdmin, async (req, res) => {
 
     await invalidateBounty(req.params.id);
     res.json(updated);
+
+    // A bounty created unapproved was not announced, so announce it now.
+    // Use the updated row from the transaction (it already includes createdByUser
+    // when the caller supplied an include). Re-fetch only if it is missing.
+    if (!bounty.isApproved) {
+      let full = updated;
+      if (!full.createdByUser) {
+        full = await prisma.bounty.findUnique({
+          where: { id: req.params.id },
+          include: { createdByUser: { select: USER_SELECT } },
+        });
+      }
+      if (full && !full.isPrivate) {
+        notifyNewBounty(full);
+        getBroadcastRecipients(full)
+          .then((recipients) => announceNewBounty(full, bounty.createdBy, recipients))
+          .catch(console.error);
+      }
+    }
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: "Failed to approve bounty" });
@@ -1505,10 +1534,11 @@ router.post("/:id/submit", authenticate, async (req, res) => {
       workSubmission,
       bountyId,
       userId,
+      await getSubmissionRecipients(bountyId, userId),
     );
     await broadcastBountyEvent(
       "bounty_updated",
-      updatedBounty,
+      withoutSubmissionBodies(updatedBounty),
       bountyId,
       userId,
     );
@@ -1807,10 +1837,14 @@ router.patch(
         updatedSubmission,
         updatedBounty.id,
         req.user.id,
+        await getSubmissionRecipients(
+          updatedBounty.id,
+          updatedSubmission.submittedBy,
+        ),
       );
       await broadcastBountyEvent(
         "bounty_updated",
-        updatedBounty,
+        withoutSubmissionBodies(updatedBounty),
         updatedBounty.id,
         req.user.id,
       );
@@ -1945,11 +1979,12 @@ router.patch("/submissions/:submissionId", authenticate, async (req, res) => {
       updated,
       submission.bountyId,
       userId,
+      await getSubmissionRecipients(submission.bountyId, userId),
     );
     if (updatedBounty)
       await broadcastBountyEvent(
         "bounty_updated",
-        updatedBounty,
+        withoutSubmissionBodies(updatedBounty),
         submission.bountyId,
         userId,
       );
@@ -2057,6 +2092,17 @@ router.patch(
       await invalidateSubmissions(keptSubmission.bountyId);
       await invalidateBounty(keptSubmission.bountyId);
 
+      // Same REST audience as a submission body, plus the people who were
+      // rejected so they learn they lost. Not every viewer of a public bounty.
+      const rejectAudience = [
+        ...new Set([
+          ...(await getSubmissionRecipients(
+            keptSubmission.bountyId,
+            keptSubmission.submittedBy,
+          )),
+          ...rejectedUserIds,
+        ]),
+      ];
       await broadcastBountyEvent(
         "submissions_rejected_others",
         {
@@ -2067,6 +2113,7 @@ router.patch(
         },
         keptSubmission.bountyId,
         req.user.id,
+        rejectAudience,
       );
       await broadcastBountyEvent(
         "bounty_assignees_updated",
@@ -2817,7 +2864,7 @@ router.get("/mine", authenticate, async (req, res) => {
 // ─── My bounty-creation quota ────────────────────────────────────────────────
 router.get("/mine/quota", authenticate, async (req, res) => {
   try {
-    if (req.user.role === "ADMIN") {
+    if (!hasWeeklyQuota(req.user.role)) {
       return res.json({
         limit: null,
         used: 0,
@@ -3126,7 +3173,10 @@ router.put("/:id", authenticate, async (req, res) => {
       return res.status(400).json({ error: "Invalid chain value" });
     }
 
-    if (Object.prototype.hasOwnProperty.call(req.body, "teamId") && req.user.role !== "ADMIN") {
+    if (
+      Object.prototype.hasOwnProperty.call(req.body, "teamId") &&
+      req.user.role !== "ADMIN"
+    ) {
       // Non-admins can't move a bounty to a different team via edit, including clearing it
       return res.status(403).json({ error: "Cannot reassign team" });
     }

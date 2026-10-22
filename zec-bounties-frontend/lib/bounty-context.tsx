@@ -184,10 +184,15 @@ interface BountyContextType {
   verifyUaddress: (z_address: string) => Promise<boolean | undefined>;
   fetchBounties: (
     reset?: boolean,
-    opts?: { chain?: "MAIN" | "TEST" | "ALL"; teamId?: string; user?: string },
+    opts?: {
+      chain?: "MAIN" | "TEST" | "ALL";
+      teamId?: string;
+      user?: string;
+      teamless?: boolean;
+    },
   ) => Promise<void>;
   loadMoreBounties: () => Promise<void>;
-  loadAllBounties: () => Promise<void>;
+  loadAllBounties: () => Promise<boolean>;
   hasMoreBounties: boolean;
   bountiesPage: number;
   myBounties: Bounty[];
@@ -2657,6 +2662,7 @@ export function BountyProvider({ children }: { children: React.ReactNode }) {
 
           case "bounties_exported":
             fetchTotalStats();
+            fetchMyBounties();
             break;
 
           case "bounty_assignees_updated":
@@ -2932,6 +2938,7 @@ export function BountyProvider({ children }: { children: React.ReactNode }) {
   // private bounties back via the visibility filter. Never use
   // getPublicHeaders() here.
   const listUserRef = useRef("");
+  const listTeamlessRef = useRef(false);
 
   const fetchBounties = async (
     reset = true,
@@ -2939,6 +2946,9 @@ export function BountyProvider({ children }: { children: React.ReactNode }) {
   ) => {
     if (opts && "user" in opts) {
       listUserRef.current = String(opts.user || "").trim();
+    }
+    if (opts && "teamless" in opts) {
+      listTeamlessRef.current = !!opts.teamless;
     }
     const requestId = ++fetchBountiesReqId.current;
     const updatesAtStart = new Map(bountyUpdates.current);
@@ -3006,7 +3016,7 @@ export function BountyProvider({ children }: { children: React.ReactNode }) {
 
   /** Fetches every page (limit 50, backend cap) and replaces the list. */
   const loadAllBounties = async () => {
-    if (bountiesLoading) return;
+    if (bountiesLoading) return false;
     const requestId = ++fetchBountiesReqId.current;
     const updatesAtStart = new Map(bountyUpdates.current);
     setBountiesLoading(true);
@@ -3014,6 +3024,7 @@ export function BountyProvider({ children }: { children: React.ReactNode }) {
       const resolvedChain = currentUser?.role === "ADMIN" ? "ALL" : "MAIN";
       const limit = 50;
       const collected: Bounty[] = [];
+      const seen = new Set<string>();
       let page = 1;
 
       while (true) {
@@ -3023,19 +3034,23 @@ export function BountyProvider({ children }: { children: React.ReactNode }) {
           chain: resolvedChain,
         });
         if (listUserRef.current) params.set("user", listUserRef.current);
+        if (listTeamlessRef.current) params.set("teamless", "true");
         const res = await fetch(`${backendUrl}/api/bounties?${params}`, {
           headers: getAuthHeaders(),
         });
         if (!res.ok) throw new Error("Failed to fetch bounties");
 
         const data = await res.json();
-        if (requestId !== fetchBountiesReqId.current) return;
+        if (requestId !== fetchBountiesReqId.current) return false;
         const incoming: Bounty[] = Array.isArray(data)
           ? data
           : (data.data ?? []);
         const total: number = data.total ?? incoming.length;
-        const seen = new Set(collected.map((b) => b.id));
-        collected.push(...incoming.filter((b) => !seen.has(b.id)));
+        for (const bounty of incoming) {
+          if (seen.has(bounty.id)) continue;
+          seen.add(bounty.id);
+          collected.push(bounty);
+        }
 
         if (
           incoming.length === 0 ||
@@ -3050,8 +3065,10 @@ export function BountyProvider({ children }: { children: React.ReactNode }) {
       setBounties(reconcileFetchedBounties(collected, updatesAtStart));
       setBountiesPage(page + 1);
       setHasMoreBounties(false);
+      return true;
     } catch (error) {
       console.error("Failed to fetch all bounties:", error);
+      return false;
     } finally {
       if (requestId === fetchBountiesReqId.current) setBountiesLoading(false);
     }

@@ -62,11 +62,18 @@ async function getBroadcastRecipients(bounty) {
   admins.forEach((a) => recipients.add(a.id));
 
   if (bounty.teamId) {
-    const members = await prisma.teamMember.findMany({
-      where: { teamId: bounty.teamId },
-      select: { userId: true },
-    });
+    const [members, favorites] = await Promise.all([
+      prisma.teamMember.findMany({
+        where: { teamId: bounty.teamId },
+        select: { userId: true },
+      }),
+      prisma.teamFavorite.findMany({
+        where: { teamId: bounty.teamId },
+        select: { userId: true },
+      }),
+    ]);
     members.forEach((m) => recipients.add(m.userId));
+    favorites.forEach((f) => recipients.add(f.userId));
   }
 
   // Assignees need not be team members. Read them fresh so callers that only
@@ -134,14 +141,57 @@ async function broadcastTeamEvent(
 // Looks the bounty up itself so callers can pass any payload shape
 // (bounty, submission, application, { bountyId }). Fails closed — if the
 // audience can't be resolved nothing is sent; clients refetch on their own.
-async function broadcastBountyEvent(type, payload, bountyId, excludeUserId) {
+// Who REST lets see one submission's body: the bounty creator, platform
+// admins, and the submitter. Assignees only see their own via REST, so other
+// assignees are not in this set. Returns [] when the bounty is gone so the
+// caller fails closed.
+async function getSubmissionRecipients(bountyId, submitterId) {
+  const bounty = await prisma.bounty.findUnique({
+    where: { id: bountyId },
+    select: { createdBy: true },
+  });
+  if (!bounty) return [];
+  const admins = await prisma.user.findMany({
+    where: { role: "ADMIN" },
+    select: { id: true },
+  });
+  return [
+    ...new Set(
+      [bounty.createdBy, submitterId, ...admins.map((a) => a.id)].filter(Boolean),
+    ),
+  ];
+}
+
+// Wide bounty_updated events must not carry submission bodies. Involved
+// clients get those on the scoped work_submitted / submission_* events.
+function withoutSubmissionBodies(bounty) {
+  if (!bounty || typeof bounty !== "object" || !Array.isArray(bounty.workSubmissions)) {
+    return bounty;
+  }
+  const { workSubmissions, ...rest } = bounty;
+  return rest;
+}
+
+// recipientsOverride scopes the event even for a public bounty. Used for
+// submission bodies, which REST does not give to every viewer of a public
+// bounty. Omit it for ordinary bounty events.
+async function broadcastBountyEvent(
+  type,
+  payload,
+  bountyId,
+  excludeUserId,
+  recipientsOverride,
+) {
   try {
     const bounty = await prisma.bounty.findUnique({
       where: { id: bountyId },
       select: { id: true, isPrivate: true, createdBy: true, teamId: true },
     });
     if (!bounty) return;
-    const recipients = await getBroadcastRecipients(bounty);
+    const recipients =
+      recipientsOverride !== undefined
+        ? recipientsOverride
+        : await getBroadcastRecipients(bounty);
     sendRealtimeUpdate(type, payload, excludeUserId, recipients);
   } catch (err) {
     console.error(`Realtime ${type} for bounty ${bountyId} not sent:`, err);
@@ -175,6 +225,11 @@ function requireOnboarded(req, res) {
 // dashboard (avatar:1 / avatar:5 / avatar:10 / avatar:15 / avatar:25 /
 // avatar:50). Gold star = 15+ completed tasks.
 const GOLD_STAR_THRESHOLD = 15;
+
+// Only these roles are subject to the weekly creation quota.
+// Every other role (ADMIN, TEAM, ...) creates bounties without a limit.
+const QUOTA_ROLES = ["HUNTER", "CLIENT"];
+const hasWeeklyQuota = (role) => QUOTA_ROLES.includes(role);
 
 const WEEKLY_BOUNTY_LIMIT_GOLD =
   process.env.NODE_ENV === "production"
@@ -249,7 +304,7 @@ class WeeklyBountyQuotaError extends Error {
 // transaction at PostgreSQL's default Read Committed isolation still allows
 // simultaneous requests to consume the same last slot.
 async function createBountyWithQuota(user, args) {
-  if (user.role === "ADMIN") return prisma.bounty.create(args);
+  if (!hasWeeklyQuota(user.role)) return prisma.bounty.create(args);
 
   for (let attempt = 0; ; attempt++) {
     try {
@@ -298,12 +353,15 @@ module.exports = {
   sendMailIfEnabled,
   sendPushToOptedIn,
   getBroadcastRecipients,
+  getSubmissionRecipients,
+  withoutSubmissionBodies,
   broadcastBountyEvent,
   broadcastTeamEvent,
   invalidateBounty,
   ONBOARDED_ROLES,
   requireOnboarded,
   getWeeklyBountyQuota,
+  hasWeeklyQuota,
   createBountyWithQuota,
   WeeklyBountyQuotaError,
   requireTaskCreation,

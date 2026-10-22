@@ -27,7 +27,7 @@ model User {
   z_address            String?
   UA_address           String?
   avatar               String?
-  githubId             String?
+  githubId             String?  @unique
 
   discordUserId        String?   @unique
   discordUsername      String?
@@ -415,10 +415,22 @@ enum TxStatus {
   FAILED     // wallet reported an error before sending — confirmed NOT sent
   UNKNOWN    // send attempted, outcome unclear (timeout) — needs a human
 }
+
 model PlatformSetting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt @default(now())
 
   @@map("platform_settings")
+}
+
+model ZecUsdMonthly {
+  month       DateTime @id @db.Date
+  avgUsd      Decimal  @map("avg_usd") @db.Decimal(12, 4)
+  closeUsd    Decimal  @map("close_usd") @db.Decimal(12, 4)
+  source      String   @default("coingecko")
+  provisional Boolean  @default(false)
+  fetchedAt   DateTime @default(now()) @map("fetched_at")
+
+  @@map("zec_usd_monthly")
 }
